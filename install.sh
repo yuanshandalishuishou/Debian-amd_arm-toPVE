@@ -53,6 +53,36 @@ function check_prerequisites() {
     done
 }
 
+function check_system_resources() {
+    log_step "检查系统资源"
+    
+    # 检查磁盘空间
+    local available_space
+    available_space=$(df / | awk 'NR==2 {print $4}')
+    if [[ "$available_space" -lt 10485760 ]]; then  # 小于10GB
+        log_error "磁盘空间不足，至少需要10GB可用空间"
+        return 1
+    fi
+    log_info "磁盘空间: 充足 ($((available_space/1024))MB 可用)"
+    
+    # 检查内存
+    local total_mem
+    total_mem=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+    if [[ "$total_mem" -lt 2097152 ]]; then  # 小于2GB
+        log_warn "内存小于2GB，可能影响Proxmox VE性能"
+    else
+        log_info "内存: 充足 ($((total_mem/1024))MB)"
+    fi
+    
+    # 检查是否已是PVE
+    if [[ -f /etc/pve/version ]]; then
+        log_error "系统已安装Proxmox VE，无需重复安装"
+        return 1
+    fi
+    
+    return 0
+}
+
 function check_debian_version() {
     log_step "验证 Debian 版本"
     
@@ -206,8 +236,10 @@ function configure_hostname() {
     log_step "配置主机名"
 
     # 获取当前主机名作为默认值
-    local current_hostname=$(hostname)
-    local current_domain=$(hostname -d 2>/dev/null || echo "local")
+    local current_hostname
+    current_hostname=$(hostname)
+    local current_domain
+    current_domain=$(hostname -d 2>/dev/null || echo "local")
     
     # 如果当前主机名包含域名，则分离
     if [[ "$current_hostname" == *.* ]]; then
@@ -319,6 +351,15 @@ EOF
 function activate_network_bridge() {
     log_step "激活网桥配置"
     
+    log_warn "注意：网络配置更改可能导致当前SSH连接中断"
+    log_warn "建议通过控制台或带外管理执行此操作"
+    
+    read -p "继续操作? (y/N): " confirm_network
+    [[ "${confirm_network,,}" != "y" ]] && { 
+        log_info "跳过网络激活，请稍后手动重启网络服务"
+        return 0
+    }
+    
     # 安装网络工具
     if ! command -v brctl &>/dev/null && ! command -v bridge &>/dev/null; then
         log_info "安装 bridge-utils..."
@@ -334,7 +375,11 @@ function activate_network_bridge() {
     sleep 2
     
     # 手动删除现有网桥（如果存在）
-    ip link delete vmbr0 2>/dev/null || true
+    if ip link show vmbr0 &>/dev/null; then
+        log_info "删除现有 vmbr0 网桥..."
+        ip link set vmbr0 down 2>/dev/null || true
+        ip link delete vmbr0 2>/dev/null || true
+    fi
     
     # 重启网络服务
     log_info "启动网络服务..."
@@ -348,14 +393,16 @@ function activate_network_bridge() {
         log_info "✅ vmbr0 网桥创建成功"
         
         # 检查IP地址
-        local has_public_ip=$(ip addr show vmbr0 | grep -c "$CURRENT_IP") || true
-        local has_local_ip=$(ip addr show vmbr0 | grep -c "192.168.250.254") || true
+        local has_public_ip
+        has_public_ip=$(ip addr show vmbr0 | grep -c "$CURRENT_IP") || true
+        local has_local_ip
+        has_local_ip=$(ip addr show vmbr0 | grep -c "192.168.250.254") || true
         
         if [[ $has_public_ip -gt 0 ]]; then
             log_info "✅ 公网 IP 配置成功"
         else
             log_warn "⚠️  公网 IP 未配置，尝试手动添加"
-            ip addr add $CURRENT_IP/$NETWORK_PREFIX dev vmbr0 2>/dev/null || true
+            ip addr add "$CURRENT_IP/$NETWORK_PREFIX" dev vmbr0 2>/dev/null || true
         fi
         
         if [[ $has_local_ip -gt 0 ]]; then
@@ -377,9 +424,9 @@ function activate_network_bridge() {
         
         # 手动创建网桥
         brctl addbr vmbr0
-        brctl addif vmbr0 $DEFAULT_INTERFACE
+        brctl addif vmbr0 "$DEFAULT_INTERFACE"
         ip link set vmbr0 up
-        ip addr add $CURRENT_IP/$NETWORK_PREFIX dev vmbr0
+        ip addr add "$CURRENT_IP/$NETWORK_PREFIX" dev vmbr0
         ip addr add 192.168.250.254/24 dev vmbr0
         
         if ip link show vmbr0 &>/dev/null; then
@@ -413,6 +460,46 @@ function run_installation() {
     }
 
     log_info "Proxmox VE 安装成功"
+}
+
+function install_routeros() {
+    log_step "安装 RouterOS 虚拟机"
+    
+    local download_url="https://drive.usercontent.google.com/download?id=1DL2uaMfWz2mDHSE_0vRLz1Fw02isTfRe&export=download&authuser=0"
+    local image_dir="/var/lib/vz/images/101"
+    
+    # 创建存储目录
+    mkdir -p "$image_dir"
+    cd "$image_dir" || { log_error "无法进入目录 $image_dir"; return 1; }
+    
+    log_info "下载 RouterOS 镜像..."
+    if ! wget -O MikroTik-RouterOS.qcow2.xz "$download_url"; then
+        log_error "RouterOS 镜像下载失败"
+        return 1
+    fi
+    
+    log_info "解压镜像文件..."
+    if ! xz -d MikroTik-RouterOS.qcow2.xz; then
+        log_error "镜像解压失败"
+        return 1
+    fi
+    
+    # 创建虚拟机配置
+    cat > /etc/pve/qemu-server/101.conf << 'EOF'
+boot: order=ide0
+cores: 1
+cpu: host
+ide0: local:101/MikroTik-RouterOS.qcow2,model=VMware%20Virtual%20IDE%20Hard%20Drive,serial=00000000000000000001
+memory: 1024
+name: MikroTik-RouterOS
+net0: virtio=BC:24:11:00:00:00,bridge=vmbr0,queues=4
+net1: virtio=BC:24:11:00:00:01,bridge=vmbr1,queues=4
+net2: virtio=BC:24:11:00:00:02,bridge=vmbr2,queues=4
+numa: 1
+sockets: 1
+EOF
+
+    log_info "RouterOS 虚拟机配置完成"
 }
 
 function show_completion_info() {
@@ -453,6 +540,7 @@ function main() {
     echo "=================================="
 
     check_prerequisites
+    check_system_resources || exit 1
     check_debian_version
     configure_architecture_specifics
 
@@ -479,6 +567,7 @@ function main() {
     run_installation
     setup_network_bridge
     activate_network_bridge
+    install_routeros
     show_completion_info
 }
 
