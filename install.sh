@@ -53,8 +53,45 @@ function check_prerequisites() {
     done
 }
 
+function remove_all_enterprise_sources() {
+    log_step "彻底清理企业订阅源"
+    
+    log_info "删除所有企业源文件..."
+    # 删除所有可能的企业源文件
+    rm -f /etc/apt/sources.list.d/pve-enterprise.* 2>/dev/null || true
+    rm -f /etc/apt/sources.list.d/ceph-enterprise.* 2>/dev/null || true
+    rm -f /etc/apt/sources.list.d/proxmox-enterprise.* 2>/dev/null || true
+    
+    # 清理 sources.list 文件中的企业源
+    if grep -q "enterprise.proxmox.com" /etc/apt/sources.list 2>/dev/null; then
+        log_info "清理 /etc/apt/sources.list 中的企业源"
+        sed -i '/enterprise.proxmox.com/d' /etc/apt/sources.list
+    fi
+    
+    # 清理可能的备份文件
+    rm -f /etc/apt/sources.list.d/pve-enterprise.list.bak 2>/dev/null || true
+    rm -f /etc/apt/sources.list.d/pve-enterprise.sources.bak 2>/dev/null || true
+    
+    # 检查是否还有企业源残留
+    local enterprise_sources
+    enterprise_sources=$(grep -r "enterprise.proxmox.com" /etc/apt/sources.list* 2>/dev/null || true)
+    
+    if [[ -n "$enterprise_sources" ]]; then
+        log_warn "发现残留的企业源配置:"
+        echo "$enterprise_sources"
+        log_info "强制清理残留配置..."
+        # 使用sed删除所有包含enterprise.proxmox.com的行
+        sed -i '/enterprise.proxmox.com/d' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
+    fi
+    
+    log_info "企业订阅源清理完成"
+}
+
 function clean_proxmox_residue() {
     log_step "清理 Proxmox 残留配置"
+    
+    # 先清理企业源
+    remove_all_enterprise_sources
     
     # 检查是否有残留的 apt hook
     if [[ -f /etc/apt/apt.conf.d/80proxmox ]] || \
@@ -64,8 +101,8 @@ function clean_proxmox_residue() {
         log_warn "检测到 Proxmox 残留配置，正在清理..."
         
         # 移除 apt hook 配置
-        rm -f /etc/apt/apt.conf.d/80proxmox
-        rm -f /etc/apt/apt.conf.d/z80proxmox
+        rm -f /etc/apt/apt.conf.d/80proxmox 2>/dev/null || true
+        rm -f /etc/apt/apt.conf.d/z80proxmox 2>/dev/null || true
         
         # 如果 pve-apt-hook 目录存在但脚本不存在，修复这个问题
         if [[ -d /usr/share/proxmox-ve ]] && [[ ! -f /usr/share/proxmox-ve/pve-apt-hook ]]; then
@@ -184,41 +221,17 @@ function configure_architecture_specifics() {
     fi
 }
 
-function remove_enterprise_sources() {
-    log_step "禁用企业订阅源"
-    
-    case "$PVE_VERSION" in
-        "9")
-            log_info "PVE 9: 禁用企业订阅源"
-            rm -f /etc/apt/sources.list.d/pve-enterprise.sources
-            ;;
-        "8")
-            log_info "PVE 8: 禁用企业订阅源"
-            rm -f /etc/apt/sources.list.d/pve-enterprise.list
-            ;;
-        "7")
-            log_info "PVE 7: 禁用企业订阅源"
-            rm -f /etc/apt/sources.list.d/pve-enterprise.list
-            ;;
-        *)
-            log_warn "未知 PVE 版本，跳过企业源删除"
-            ;;
-    esac
-    
-    # 额外清理可能存在的其他企业源文件
-    rm -f /etc/apt/sources.list.d/ceph-enterprise.list
-    rm -f /etc/apt/sources.list.d/pve-enterprise.sources
-    rm -f /etc/apt/sources.list.d/pve-enterprise.list
-    
-    log_info "企业订阅源已禁用"
-}
-
 function install_essential_tools() {
     log_step "安装必要工具"
     
+    # 先彻底清理企业源
+    remove_all_enterprise_sources
+    
     # 先更新系统
     log_info "更新系统包列表..."
-    apt-get update
+    if ! apt-get update; then
+        log_warn "首次更新失败，但继续执行..."
+    fi
     
     # 修复损坏的包状态（如果有）
     log_info "修复包状态..."
@@ -483,8 +496,13 @@ function activate_network_bridge() {
     # 安装必要的网络工具
     log_info "安装网络工具..."
     
+    # 先清理企业源，避免更新失败
+    remove_all_enterprise_sources
+    
     # 更新包列表
-    apt-get update
+    if ! apt-get update; then
+        log_warn "包列表更新失败，但继续执行网络配置..."
+    fi
     
     # 逐个安装网络工具，避免触发问题
     local network_packages=("bridge-utils" "net-tools")
@@ -556,10 +574,60 @@ function activate_network_bridge() {
     fi
 }
 
+function check_pve_services() {
+    log_step "检查 Proxmox VE 服务状态"
+    
+    local services=("pveproxy" "pvedaemon" "pvestatd" "pve-cluster")
+    local all_running=true
+    
+    for service in "${services[@]}"; do
+        if systemctl is-active --quiet "$service"; then
+            log_info "✅ $service 正在运行"
+        else
+            log_warn "⚠️  $service 未运行，尝试启动..."
+            if systemctl start "$service" 2>/dev/null; then
+                log_info "✅ $service 启动成功"
+            else
+                log_error "❌ $service 启动失败"
+                all_running=false
+            fi
+        fi
+    done
+    
+    # 等待服务完全启动
+    if $all_running; then
+        log_info "等待 Proxmox VE 服务完全初始化..."
+        sleep 5
+        
+        # 检查 /etc/pve 目录是否存在
+        local max_attempts=10
+        local attempt=1
+        
+        while [[ $attempt -le $max_attempts ]]; do
+            if [[ -d /etc/pve ]] && [[ -d /etc/pve/nodes ]]; then
+                log_info "✅ Proxmox VE 配置目录已就绪"
+                return 0
+            fi
+            log_info "等待 Proxmox VE 配置目录... ($attempt/$max_attempts)"
+            sleep 3
+            ((attempt++))
+        done
+        
+        log_error "❌ Proxmox VE 配置目录未在预期时间内创建"
+        return 1
+    else
+        log_error "❌ 必要的 Proxmox VE 服务未运行"
+        return 1
+    fi
+}
+
 function run_installation() {
     log_step "安装 Proxmox VE"
     
-    # 首先修复任何apt配置问题
+    # 首先彻底清理企业源
+    remove_all_enterprise_sources
+    
+    # 修复任何apt配置问题
     log_info "修复APT配置..."
     rm -f /etc/apt/apt.conf.d/80proxmox 2>/dev/null || true
     
@@ -574,14 +642,18 @@ function run_installation() {
         fi
     fi
 
-    echo "deb ${MIRROR_BASE} ${DEBIAN_CODENAME} ${PVE_REPO_COMPONENT}" > /etc/apt/sources.list.d/pve-install.list
+    # 创建我们的软件源，使用非企业源
+    echo "deb ${MIRROR_BASE} ${DEBIAN_CODENAME} ${PVE_REPO_COMPONENT}" > /etc/apt/sources.list.d/pve-no-subscription.list
     
-    # 禁用企业订阅源
-    remove_enterprise_sources
+    # 再次确认清理企业源
+    remove_all_enterprise_sources
     
     log_info "更新软件包列表..."
     if ! apt-get update; then
-        log_warn "软件包更新出现问题，但尝试继续"
+        log_error "软件包更新失败，请检查网络连接和软件源配置"
+        log_info "当前配置的软件源:"
+        cat /etc/apt/sources.list.d/*.list 2>/dev/null || echo "无软件源配置"
+        exit 1
     fi
     
     log_info "安装 Proxmox VE 核心包..."
@@ -592,12 +664,12 @@ function run_installation() {
     apt-get install -y proxmox-default-kernel 2>/dev/null || true
     
     log_info "阶段2: 安装主要组件..."
-    if ! apt-get install -y proxmox-ve; then
+    if ! apt-get install -y proxmox-ve postfix open-iscsi; then
         log_error "Proxmox VE 安装失败"
         log_info "尝试替代安装方法..."
         
         # 尝试逐个安装关键组件
-        local pve_packages=("pve-manager" "pve-kernel-6.8" "qemu-server" "pve-firmware")
+        local pve_packages=("pve-manager" "pve-kernel-6.8" "qemu-server" "pve-firmware" "postfix" "open-iscsi")
         for pkg in "${pve_packages[@]}"; do
             log_info "安装 $pkg..."
             apt-get install -y "$pkg" 2>/dev/null || true
@@ -611,6 +683,11 @@ function run_installation() {
     fi
     
     log_info "Proxmox VE 安装成功"
+    
+    # 检查服务状态
+    if ! check_pve_services; then
+        log_warn "Proxmox VE 服务未完全启动，但安装已完成"
+    fi
 }
 
 function install_routeros() {
@@ -635,7 +712,32 @@ function install_routeros() {
         return 1
     fi
     
+    # 检查 Proxmox VE 配置目录是否存在
+    if [[ ! -d /etc/pve/qemu-server ]]; then
+        log_warn "Proxmox VE 配置目录不存在，等待服务启动..."
+        
+        # 尝试启动服务
+        systemctl start pve-cluster 2>/dev/null || true
+        systemctl start pvedaemon 2>/dev/null || true
+        
+        # 等待目录创建
+        local max_wait=30
+        local waited=0
+        while [[ $waited -lt $max_wait ]] && [[ ! -d /etc/pve/qemu-server ]]; do
+            sleep 3
+            ((waited+=3))
+            log_info "等待 Proxmox VE 配置目录... ${waited}s/${max_wait}s"
+        done
+        
+        if [[ ! -d /etc/pve/qemu-server ]]; then
+            log_error "Proxmox VE 配置目录仍未创建，无法创建虚拟机配置"
+            log_info "RouterOS 镜像已下载，但需要重启后手动创建虚拟机"
+            return 1
+        fi
+    fi
+    
     # 创建虚拟机配置
+    log_info "创建 RouterOS 虚拟机配置..."
     cat > /etc/pve/qemu-server/101.conf << 'EOF'
 boot: order=ide0
 cores: 1
@@ -680,6 +782,20 @@ function show_completion_info() {
         log_error "❌ vmbr0 网桥未激活"
         log_info "当前网络接口:"
         ip addr show | grep -E "^(inet|^[0-9]+:)" | head -10
+    fi
+    
+    # 检查 Proxmox VE 状态
+    log_info "\nProxmox VE 状态:"
+    if systemctl is-active --quiet pveproxy; then
+        log_info "✅ Proxmox VE Web 界面: 运行中"
+    else
+        log_warn "⚠️  Proxmox VE Web 界面: 未运行"
+    fi
+    
+    if [[ -d /etc/pve/qemu-server ]]; then
+        log_info "✅ 虚拟机配置目录: 就绪"
+    else
+        log_warn "⚠️  虚拟机配置目录: 未就绪"
     fi
     
     log_warn "重要：建议重启系统以确保所有网络配置生效"
