@@ -744,10 +744,11 @@ cores: 1
 cpu: host
 ide0: local:101/MikroTik-RouterOS.qcow2,model=VMware%20Virtual%20IDE%20Hard%20Drive,serial=00000000000000000001
 memory: 1024
-name: MikroTik-RouterOS
-net0: virtio=BC:24:11:00:00:00,bridge=vmbr0,queues=4
-net1: virtio=BC:24:11:00:00:01,bridge=vmbr1,queues=4
-net2: virtio=BC:24:11:00:00:02,bridge=vmbr2,queues=4
+name: RouterOS
+#net0: virtio=BC:24:11:00:00:00,bridge=vmbr0,queues=4
+#net1: virtio=BC:24:11:00:00:01,bridge=vmbr1,queues=4
+net0: virtio=BC:24:11:00:00:00,bridge=eth0,queues=4
+net1: virtio=BC:24:11:00:00:01,bridge=eth0,queues=4
 numa: 1
 sockets: 1
 EOF
