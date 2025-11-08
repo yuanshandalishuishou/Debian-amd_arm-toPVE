@@ -53,6 +53,61 @@ function check_prerequisites() {
     done
 }
 
+function clean_proxmox_residue() {
+    log_step "清理 Proxmox 残留配置"
+    
+    # 检查是否有残留的 apt hook
+    if [[ -f /etc/apt/apt.conf.d/80proxmox ]] || \
+       dpkg -l | grep -q proxmox || \
+       [[ -d /usr/share/proxmox-ve ]]; then
+        
+        log_warn "检测到 Proxmox 残留配置，正在清理..."
+        
+        # 移除 apt hook 配置
+        rm -f /etc/apt/apt.conf.d/80proxmox
+        rm -f /etc/apt/apt.conf.d/z80proxmox
+        
+        # 如果 pve-apt-hook 目录存在但脚本不存在，修复这个问题
+        if [[ -d /usr/share/proxmox-ve ]] && [[ ! -f /usr/share/proxmox-ve/pve-apt-hook ]]; then
+            log_info "修复损坏的 pve-apt-hook 配置..."
+            # 创建一个空的 pve-apt-hook 来避免错误
+            cat > /usr/share/proxmox-ve/pve-apt-hook << 'EOF'
+#!/bin/sh
+exit 0
+EOF
+            chmod +x /usr/share/proxmox-ve/pve-apt-hook
+        fi
+        
+        # 清理可能的包残留
+        if dpkg -l | grep -q proxmox; then
+            log_info "移除 Proxmox 相关包..."
+            apt-get remove --purge -y proxmox-ve pve-manager pve-kernel-* 2>/dev/null || true
+            apt-get autoremove -y 2>/dev/null || true
+        fi
+        
+        # 清理配置目录
+        rm -rf /etc/pve 2>/dev/null || true
+        rm -rf /var/lib/pve-manager 2>/dev/null || true
+    fi
+    
+    log_info "残留配置清理完成"
+}
+
+function check_proxmox_installed() {
+    log_step "检查 Proxmox VE 安装状态"
+    
+    # 检查是否已是完整安装的PVE
+    if [[ -f /etc/pve/version ]]; then
+        log_error "系统已安装Proxmox VE，无需重复安装"
+        return 1
+    fi
+    
+    # 清理残留配置
+    clean_proxmox_residue
+    
+    return 0
+}
+
 function check_system_resources() {
     log_step "检查系统资源"
     
@@ -72,12 +127,6 @@ function check_system_resources() {
         log_warn "内存小于2GB，可能影响Proxmox VE性能"
     else
         log_info "内存: 充足 ($((total_mem/1024))MB)"
-    fi
-    
-    # 检查是否已是PVE
-    if [[ -f /etc/pve/version ]]; then
-        log_error "系统已安装Proxmox VE，无需重复安装"
-        return 1
     fi
     
     return 0
@@ -133,6 +182,79 @@ function configure_architecture_specifics() {
         PVE_REPO_COMPONENT="port"
         PVE_GPG_KEY_URL="${MIRROR_BASE}/port.gpg"
     fi
+}
+
+function remove_enterprise_sources() {
+    log_step "禁用企业订阅源"
+    
+    case "$PVE_VERSION" in
+        "9")
+            log_info "PVE 9: 禁用企业订阅源"
+            rm -f /etc/apt/sources.list.d/pve-enterprise.sources
+            ;;
+        "8")
+            log_info "PVE 8: 禁用企业订阅源"
+            rm -f /etc/apt/sources.list.d/pve-enterprise.list
+            ;;
+        "7")
+            log_info "PVE 7: 禁用企业订阅源"
+            rm -f /etc/apt/sources.list.d/pve-enterprise.list
+            ;;
+        *)
+            log_warn "未知 PVE 版本，跳过企业源删除"
+            ;;
+    esac
+    
+    # 额外清理可能存在的其他企业源文件
+    rm -f /etc/apt/sources.list.d/ceph-enterprise.list
+    rm -f /etc/apt/sources.list.d/pve-enterprise.sources
+    rm -f /etc/apt/sources.list.d/pve-enterprise.list
+    
+    log_info "企业订阅源已禁用"
+}
+
+function install_essential_tools() {
+    log_step "安装必要工具"
+    
+    # 先更新系统
+    log_info "更新系统包列表..."
+    apt-get update
+    
+    # 修复损坏的包状态（如果有）
+    log_info "修复包状态..."
+    dpkg --configure -a 2>/dev/null || true
+    apt-get install -f -y 2>/dev/null || true
+    
+    # 安装必要包 - 使用更安全的方式
+    log_info "安装基本网络工具..."
+    
+    # 逐个安装包，避免批量安装触发问题
+    local essential_packages=("net-tools" "curl" "wget" "gnupg")
+    for pkg in "${essential_packages[@]}"; do
+        if ! dpkg -l | grep -q "^ii  $pkg "; then
+            log_info "安装 $pkg..."
+            if ! apt-get install -y --allow-downgrades --allow-remove-essential --allow-change-held-packages "$pkg"; then
+                log_warn "$pkg 安装出现问题，但尝试继续"
+            fi
+        else
+            log_info "$pkg 已安装"
+        fi
+    done
+    
+    # 单独处理 ifupdown，因为它可能触发 pve-apt-hook
+    if ! dpkg -l | grep -q "^ii  ifupdown "; then
+        log_info "安装 ifupdown..."
+        # 使用更保守的方式安装
+        if ! apt-get download ifupdown; then
+            log_warn "无法下载 ifupdown，跳过安装"
+        else
+            dpkg -i ifupdown*.deb 2>/dev/null || true
+            apt-get install -f -y 2>/dev/null || true
+            rm -f ifupdown*.deb
+        fi
+    fi
+    
+    log_info "必要工具安装完成"
 }
 
 function detect_network_info() {
@@ -360,8 +482,26 @@ function activate_network_bridge() {
     
     # 安装必要的网络工具
     log_info "安装网络工具..."
+    
+    # 更新包列表
     apt-get update
-    apt-get install -y bridge-utils net-tools ifupdown
+    
+    # 逐个安装网络工具，避免触发问题
+    local network_packages=("bridge-utils" "net-tools")
+    for pkg in "${network_packages[@]}"; do
+        if ! dpkg -l | grep -q "^ii  $pkg "; then
+            log_info "安装 $pkg..."
+            if apt-get download "$pkg" 2>/dev/null; then
+                dpkg -i "${pkg}"*.deb 2>/dev/null || true
+                rm -f "${pkg}"*.deb
+            else
+                log_warn "无法下载 $pkg，跳过"
+            fi
+        fi
+    done
+    
+    # 修复包依赖
+    apt-get install -f -y 2>/dev/null || true
     
     # 停止可能的网络管理器
     log_info "停止网络管理器..."
@@ -380,7 +520,16 @@ function activate_network_bridge() {
     
     # 重启网络服务
     log_info "重启网络服务..."
-    systemctl restart networking
+    if systemctl restart networking; then
+        log_info "网络服务重启成功"
+    else
+        log_warn "网络服务重启失败，尝试手动配置"
+        # 手动配置网桥
+        brctl addbr vmbr0 2>/dev/null || true
+        brctl addif vmbr0 "$DEFAULT_INTERFACE" 2>/dev/null || true
+        ip link set vmbr0 up 2>/dev/null || true
+        ip link set "$DEFAULT_INTERFACE" up 2>/dev/null || true
+    fi
     
     # 等待网络稳定
     sleep 3
@@ -389,80 +538,78 @@ function activate_network_bridge() {
     if ip link show vmbr0 &>/dev/null; then
         log_info "✅ vmbr0 网桥创建成功"
         
-        # 检查IP配置
-        local bridge_ips
-        bridge_ips=$(ip addr show vmbr0 2>/dev/null | grep inet | awk '{print $2}' || echo "")
-        
-        if echo "$bridge_ips" | grep -q "$CURRENT_IP"; then
-            log_info "✅ 公网 IP 配置成功"
-        else
-            log_warn "⚠️  公网 IP 未配置，尝试手动添加"
-            ip addr add "$CURRENT_IP/$NETWORK_PREFIX" dev vmbr0 2>/dev/null || true
-        fi
-        
-        if echo "$bridge_ips" | grep -q "192.168.250.254"; then
-            log_info "✅ 本地 IP 配置成功"
-        else
-            log_warn "⚠️  本地 IP 未配置，尝试手动添加"
-            ip addr add 192.168.250.254/24 dev vmbr0 2>/dev/null || true
-        fi
-        
-        # 添加默认路由
+        # 配置IP地址
+        ip addr add "$CURRENT_IP/$NETWORK_PREFIX" dev vmbr0 2>/dev/null || true
+        ip addr add 192.168.250.254/24 dev vmbr0 2>/dev/null || true
         ip route add default via "$CURRENT_GATEWAY" dev vmbr0 2>/dev/null || true
         
         echo -e "\n当前网桥状态:"
-        ip addr show vmbr0 | grep inet
+        ip addr show vmbr0 | grep inet || echo "   未配置IP"
         echo -e "\n网桥链接状态:"
         bridge link show 2>/dev/null || brctl show 2>/dev/null || echo "无法显示网桥链接信息"
         
         return 0
     else
-        log_error "❌ vmbr0 网桥创建失败，尝试手动创建..."
-        
-        # 手动创建网桥
-        brctl addbr vmbr0
-        brctl addif vmbr0 "$DEFAULT_INTERFACE"
-        ip link set vmbr0 up
-        ip link set "$DEFAULT_INTERFACE" up
-        ip addr add "$CURRENT_IP/$NETWORK_PREFIX" dev vmbr0
-        ip addr add 192.168.250.254/24 dev vmbr0
-        ip route add default via "$CURRENT_GATEWAY" dev vmbr0
-        
-        if ip link show vmbr0 &>/dev/null; then
-            log_info "✅ 手动创建网桥成功"
-            log_info "请重启系统以确保配置持久化"
-            return 0
-        else
-            log_error "❌ 网桥创建完全失败"
-            log_info "请检查以下项目:"
-            log_info "1. 网络接口 $DEFAULT_INTERFACE 是否存在"
-            log_info "2. 系统是否支持网桥"
-            log_info "3. 查看系统日志: journalctl -u networking"
-            return 1
-        fi
+        log_error "❌ vmbr0 网桥创建失败"
+        log_info "网桥配置已保存，重启后生效"
+        return 1
     fi
 }
 
 function run_installation() {
     log_step "安装 Proxmox VE"
     
+    # 首先修复任何apt配置问题
+    log_info "修复APT配置..."
+    rm -f /etc/apt/apt.conf.d/80proxmox 2>/dev/null || true
+    
     log_info "下载 GPG 密钥..."
     local gpg_key_name="proxmox-release-${DEBIAN_CODENAME}.gpg"
-    curl -fsSL "${PVE_GPG_KEY_URL}" -o "/etc/apt/trusted.gpg.d/${gpg_key_name}" || {
-        log_error "GPG 密钥下载失败"; exit 1;
-    }
+    if ! curl -fsSL "${PVE_GPG_KEY_URL}" -o "/etc/apt/trusted.gpg.d/${gpg_key_name}"; then
+        log_error "GPG 密钥下载失败"
+        # 尝试替代方案
+        if ! wget -O "/etc/apt/trusted.gpg.d/${gpg_key_name}" "${PVE_GPG_KEY_URL}"; then
+            log_error "无法下载 GPG 密钥，安装中止"
+            exit 1
+        fi
+    fi
 
-    echo "deb ${MIRROR_BASE} ${DEBIAN_CODENAME} ${PVE_REPO_COMPONENT}" > /etc/apt/sources.list.d/pve.list
+    echo "deb ${MIRROR_BASE} ${DEBIAN_CODENAME} ${PVE_REPO_COMPONENT}" > /etc/apt/sources.list.d/pve-install.list
+    
+    # 禁用企业订阅源
+    remove_enterprise_sources
     
     log_info "更新软件包列表..."
-    apt-get update || { log_error "软件包更新失败"; exit 1; }
+    if ! apt-get update; then
+        log_warn "软件包更新出现问题，但尝试继续"
+    fi
     
     log_info "安装 Proxmox VE 核心包..."
     export DEBIAN_FRONTEND=noninteractive
-    apt-get install -y proxmox-ve postfix open-iscsi || {
-        log_error "Proxmox VE 安装失败"; exit 1;
-    }
-
+    
+    # 使用更安全的安装方式
+    log_info "阶段1: 安装基础组件..."
+    apt-get install -y proxmox-default-kernel 2>/dev/null || true
+    
+    log_info "阶段2: 安装主要组件..."
+    if ! apt-get install -y proxmox-ve; then
+        log_error "Proxmox VE 安装失败"
+        log_info "尝试替代安装方法..."
+        
+        # 尝试逐个安装关键组件
+        local pve_packages=("pve-manager" "pve-kernel-6.8" "qemu-server" "pve-firmware")
+        for pkg in "${pve_packages[@]}"; do
+            log_info "安装 $pkg..."
+            apt-get install -y "$pkg" 2>/dev/null || true
+        done
+        
+        # 最后尝试安装元包
+        apt-get install -y proxmox-ve 2>/dev/null || {
+            log_error "Proxmox VE 安装完全失败"
+            exit 1
+        }
+    fi
+    
     log_info "Proxmox VE 安装成功"
 }
 
@@ -497,7 +644,8 @@ ide0: local:101/MikroTik-RouterOS.qcow2,model=VMware%20Virtual%20IDE%20Hard%20Dr
 memory: 1024
 name: MikroTik-RouterOS
 net0: virtio=BC:24:11:00:00:00,bridge=vmbr0,queues=4
-net1: virtio=BC:24:11:00:00:01,bridge=vmbr0,queues=4
+net1: virtio=BC:24:11:00:00:01,bridge=vmbr1,queues=4
+net2: virtio=BC:24:11:00:00:02,bridge=vmbr2,queues=4
 numa: 1
 sockets: 1
 EOF
@@ -553,11 +701,15 @@ function main() {
     echo "=================================="
 
     check_prerequisites
+    check_proxmox_installed || exit 1
     check_system_resources || exit 1
     check_debian_version
     configure_architecture_specifics
 
-    # 先获取网络信息
+    # 先安装必要工具
+    install_essential_tools
+
+    # 然后获取网络信息
     get_network_info || exit 1
     
     # 然后配置主机名
@@ -575,8 +727,6 @@ function main() {
     read -p "开始安装? (y/N): " final_confirm
     [[ "${final_confirm,,}" != "y" ]] && { log_error "安装取消"; exit 1; }
 
-    apt install -y net-tools
-    rm -rf /etc/apt/sources.list.d/pve-enterprise.sources
     run_installation
     setup_network_bridge
     activate_network_bridge
