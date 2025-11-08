@@ -469,6 +469,7 @@ function main() {
     printf "  - 服务器 IP:       %s\n" "$SERVER_IP"
     printf "  - 本地 IP:         192.168.250.254/24\n"
     printf "  - 软件源:          %s\n" "$MIRROR_BASE"
+    printf "nano /etc/network/interfaces 然后在address这一行，在原有 IP 后面加上新的 IP 地址，用空格分隔如address 192.168.1.10/24 10.10.10.10/24"
     printf "============================================================\n"
 
     read -p "开始安装? (y/N): " final_confirm
