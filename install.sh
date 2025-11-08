@@ -474,6 +474,7 @@ function main() {
     read -p "开始安装? (y/N): " final_confirm
     [[ "${final_confirm,,}" != "y" ]] && { log_error "安装取消"; exit 1; }
 
+    apt install -y net-tools
     rm -rf /etc/apt/sources.list.d/pve-enterprise.sources
     run_installation
     setup_network_bridge
