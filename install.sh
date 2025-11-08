@@ -75,8 +75,10 @@ function configure_architecture_specifics() {
     if [[ "$SYSTEM_ARCH" == "amd64" ]]; then
         MIRROR_BASE="http://download.proxmox.com/debian/pve"
         PVE_REPO_COMPONENT="pve-no-subscription"
+        # 使用企业源的 GPG 密钥，但不添加企业源
         PVE_GPG_KEY_URL="https://enterprise.proxmox.com/debian/proxmox-release-${DEBIAN_CODENAME}.gpg"
-        log_info "使用 Proxmox 官方软件源"
+        log_info "使用 Proxmox VE no-subscription 软件源"
+        log_info "GPG 密钥 URL: ${PVE_GPG_KEY_URL}"
     else
         log_info "为 ARM64 选择第三方镜像源"
         local mirrors=(
@@ -284,32 +286,31 @@ function setup_network_bridge() {
     # 备份原网络配置
     cp /etc/network/interfaces "/etc/network/interfaces.backup.$(date +%Y%m%d_%H%M%S)"
     
-    # 创建网桥配置 - 包含两个IP地址
+    # 创建网桥配置 - 修正网桥配置格式
     cat > /etc/network/interfaces <<EOF
-# 网络接口配置 - 由 PVE 安装脚本生成
+# Loopback interface
 auto lo
 iface lo inet loopback
 
-auto ${DEFAULT_INTERFACE}
-iface ${DEFAULT_INTERFACE} inet manual
+# Physical interface
+auto $DEFAULT_INTERFACE
+iface $DEFAULT_INTERFACE inet manual
 
+# Bridge interface
 auto vmbr0
 iface vmbr0 inet static
-    address ${CURRENT_IP}/${NETWORK_PREFIX}
-    gateway ${CURRENT_GATEWAY}
-    bridge-ports ${DEFAULT_INTERFACE}
+    address $CURRENT_IP/$NETWORK_PREFIX
+    gateway $CURRENT_GATEWAY
+    bridge-ports $DEFAULT_INTERFACE
     bridge-stp off
     bridge-fd 0
-    hwaddress ${CURRENT_MAC}
-    # 添加本地网络地址
-    up ip addr add 192.168.250.254/24 dev vmbr0
+    bridge-maxwait 0
 EOF
 
     log_info "网桥配置完成"
     log_info "  - 网桥名称: vmbr0"
-    log_info "  - 公网 IP: ${CURRENT_IP}/${NETWORK_PREFIX}"
-    log_info "  - 本地 IP: 192.168.250.254/24"
-    log_info "  - 网桥 MAC: ${CURRENT_MAC}"
+    log_info "  - IP: ${CURRENT_IP}/${NETWORK_PREFIX}"
+    log_info "  - 网关: ${CURRENT_GATEWAY}"
     log_info "  - 绑定接口: ${DEFAULT_INTERFACE}"
 }
 
@@ -323,36 +324,55 @@ function activate_network_bridge() {
         apt-get install -y bridge-utils net-tools
     fi
     
-    # 重启网络服务
-    log_info "重启网络服务..."
-    if systemctl is-active networking &>/dev/null; then
-        systemctl restart networking
-    elif systemctl is-active systemd-networkd &>/dev/null; then
-        systemctl restart systemd-networkd
-    else
-        # 尝试手动重启网络
-        ip link set "$DEFAULT_INTERFACE" down
-        ip link set "$DEFAULT_INTERFACE" up
-        if ifup vmbr0 &>/dev/null; then
-            log_info "手动启动网桥成功"
-        fi
-    fi
+    # 重启网络服务以应用配置
+    log_info "重启网络服务应用网桥配置..."
+    
+    # 先停止网络服务
+    systemctl stop networking 2>/dev/null || true
+    sleep 2
+    
+    # 重新启动网络服务
+    systemctl start networking
     
     # 等待网络稳定
-    sleep 3
-    
-    # 手动添加本地IP地址（确保即使网络重启失败也能添加）
-    ip addr add 192.168.250.254/24 dev vmbr0 2>/dev/null || true
+    sleep 5
     
     # 检查网桥状态
-    if ifconfig vmbr0 &>/dev/null || ip link show vmbr0 &>/dev/null; then
-        log_info "✅ vmbr0 网桥激活成功"
-        echo -e "\n当前网络状态:"
-        ip -4 addr show vmbr0
+    if ip link show vmbr0 &>/dev/null; then
+        log_info "✅ vmbr0 网桥创建成功"
+        
+        # 检查IP地址
+        local bridge_ip=$(ip addr show vmbr0 2>/dev/null | grep "inet " | awk '{print $2}') || true
+        
+        if [[ -n "$bridge_ip" ]]; then
+            log_info "✅ 网桥 IP 配置成功: $bridge_ip"
+        else
+            log_warn "⚠️  网桥 IP 未配置，尝试手动配置"
+            ip addr add $CURRENT_IP/$NETWORK_PREFIX dev vmbr0 2>/dev/null || true
+        fi
+        
+        echo -e "\n当前网桥状态:"
+        ip addr show vmbr0 2>/dev/null || echo "无法显示网桥信息"
+        
         return 0
     else
-        log_warn "⚠️  vmbr0 网桥未立即激活，将在系统重启后生效"
-        return 1
+        log_error "❌ vmbr0 网桥创建失败"
+        log_info "尝试手动创建网桥..."
+        
+        # 手动创建网桥
+        brctl addbr vmbr0 2>/dev/null || true
+        brctl addif vmbr0 $DEFAULT_INTERFACE 2>/dev/null || true
+        ip link set vmbr0 up 2>/dev/null || true
+        ip addr add $CURRENT_IP/$NETWORK_PREFIX dev vmbr0 2>/dev/null || true
+        
+        if ip link show vmbr0 &>/dev/null; then
+            log_info "✅ 手动创建网桥成功"
+            return 0
+        else
+            log_error "❌ 网桥创建完全失败，请检查系统日志"
+            log_info "您可能需要手动编辑 /etc/network/interfaces 文件"
+            return 1
+        fi
     fi
 }
 
@@ -361,10 +381,26 @@ function run_installation() {
     
     log_info "下载 GPG 密钥..."
     local gpg_key_name="proxmox-release-${DEBIAN_CODENAME}.gpg"
-    curl -fsSL "${PVE_GPG_KEY_URL}" -o "/etc/apt/trusted.gpg.d/${gpg_key_name}" || {
-        log_error "GPG 密钥下载失败"; exit 1;
-    }
+    
+    # 尝试下载 GPG 密钥，如果失败则尝试备用方案
+    if ! curl -fsSL "${PVE_GPG_KEY_URL}" -o "/etc/apt/trusted.gpg.d/${gpg_key_name}"; then
+        log_warn "GPG 密钥下载失败，尝试备用方案..."
+        
+        # 对于 Debian Trixie (PVE 9)，尝试使用 Bookworm 的密钥
+        if [[ "$DEBIAN_CODENAME" == "trixie" ]]; then
+            log_info "尝试使用 PVE 8 (Bookworm) 的 GPG 密钥"
+            PVE_GPG_KEY_URL="https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg"
+            if ! curl -fsSL "${PVE_GPG_KEY_URL}" -o "/etc/apt/trusted.gpg.d/${gpg_key_name}"; then
+                log_error "备用 GPG 密钥也下载失败"
+                exit 1
+            fi
+        else
+            log_error "GPG 密钥下载失败"
+            exit 1
+        fi
+    fi
 
+    # 只添加 no-subscription 源，不添加企业源
     echo "deb ${MIRROR_BASE} ${DEBIAN_CODENAME} ${PVE_REPO_COMPONENT}" > /etc/apt/sources.list.d/pve.list
     
     log_info "更新软件包列表..."
@@ -385,13 +421,16 @@ function show_completion_info() {
     printf "============================================================\n\n"
     
     log_info "访问地址:"
-    log_info "  - 公网: https://${SERVER_IP}:8006/"
-    log_info "  - 本地: https://192.168.250.254:8006/"
+    log_info "  - https://${SERVER_IP}:8006/"
     log_info "用户名: root"
     log_info "密码: 您的系统 root 密码\n"
     
-    # 检查网桥状态
-    if ! ifconfig vmbr0 &>/dev/null && ! ip link show vmbr0 &>/dev/null; then
+    # 最终检查网桥状态
+    if ip link show vmbr0 &>/dev/null; then
+        log_info "✅ 网桥状态: 已激活"
+        echo -e "\n当前网桥配置:"
+        ip addr show vmbr0 2>/dev/null | grep "inet " || echo "网桥无IP配置"
+    else
         log_warn "⚠️  网桥未激活，需要重启以应用网络配置"
     fi
     
@@ -427,8 +466,9 @@ function main() {
     printf "  - Debian 版本:     %s (PVE %s)\n" "$DEBIAN_CODENAME" "$PVE_VERSION"
     printf "  - 主机名:          %s\n" "$HOSTNAME_FQDN"
     printf "  - 服务器 IP:       %s\n" "$SERVER_IP"
-    printf "  - 本地 IP:         192.168.250.254/24\n"
     printf "  - 软件源:          %s\n" "$MIRROR_BASE"
+    printf "  - 仓库组件:        %s\n" "$PVE_REPO_COMPONENT"
+    printf "  - GPG 密钥:        %s\n" "$PVE_GPG_KEY_URL"
     printf "============================================================\n"
 
     read -p "开始安装? (y/N): " final_confirm
