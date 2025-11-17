@@ -1,3 +1,7 @@
+#使用以下命令下载脚本：
+#wget https://raw.githubusercontent.com/yuanshandalishuishou/Debian-amd_arm-toPVE/main/install_pve_from_iso.sh
+
+
 #!/bin/bash
 
 # 颜色定义
