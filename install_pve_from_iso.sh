@@ -1,4 +1,3 @@
-#使用方法 wget https://raw.githubusercontent.com/yuanshandalishuishou/Debian-amd_arm-toPVE/main/install_pve_from_iso.sh && bash ./install_pve_from_iso.sh
 #!/bin/bash
 
 # 颜色定义
@@ -37,6 +36,11 @@ TEXT["en_lang_1"]="1. English"
 TEXT["en_lang_2"]="2. 中文 (Chinese)"
 TEXT["en_lang_choose"]="Please select language (1-2)"
 TEXT["en_lang_changed"]="Language changed to English"
+TEXT["en_iso_menu"]="Please select the system to download:"
+TEXT["en_iso_1"]="1. Proxmox VE 8.4"
+TEXT["en_iso_2"]="2. Proxmox VE 9.0"
+TEXT["en_iso_3"]="3. Debian 12.12.0"
+TEXT["en_iso_4"]="4. Custom ISO URL"
 
 # 中文文本
 TEXT["zh_title"]="网络引导安装工具"
@@ -62,6 +66,11 @@ TEXT["zh_lang_1"]="1. English (英语)"
 TEXT["zh_lang_2"]="2. 中文 (Chinese)"
 TEXT["zh_lang_choose"]="请选择语言 (1-2)"
 TEXT["zh_lang_changed"]="语言已切换为中文"
+TEXT["zh_iso_menu"]="请选择要下载的系统:"
+TEXT["zh_iso_1"]="1. Proxmox VE 8.4"
+TEXT["zh_iso_2"]="2. Proxmox VE 9.0"
+TEXT["zh_iso_3"]="3. Debian 12.12.0"
+TEXT["zh_iso_4"]="4. 自定义ISO URL"
 
 # 检查root权限
 check_root() {
@@ -331,34 +340,30 @@ local_download_install() {
     apt update && apt upgrade -y && apt install -y curl wget net-tools sudo
     
     # 选择要下载的ISO
+    echo -e "${BLUE}${TEXT[${LANG}_iso_menu]}${NC}"
+    echo "${TEXT[${LANG}_iso_1]}"
+    echo "${TEXT[${LANG}_iso_2]}"
+    echo "${TEXT[${LANG}_iso_3]}"
+    echo "${TEXT[${LANG}_iso_4]}"
+    
     if [ "$LANG" = "en" ]; then
-        echo -e "${BLUE}Please select the system to download:${NC}"
-        echo "1. Proxmox VE 8.4"
-        echo "2. Debian 12"
-        echo "3. Ubuntu 22.04 LTS"
-        echo "4. Custom ISO URL"
         read -p "Please select (1-4): " iso_choice
     else
-        echo -e "${BLUE}请选择要下载的系统:${NC}"
-        echo "1. Proxmox VE 8.4"
-        echo "2. Debian 12"
-        echo "3. Ubuntu 22.04 LTS"
-        echo "4. 自定义ISO URL"
         read -p "请选择 (1-4): " iso_choice
     fi
     
     case $iso_choice in
         1)
-            iso_url="https://download.proxmox.com/iso/proxmox-ve_8.4-1.iso"
+            iso_url="https://enterprise.proxmox.com/iso/proxmox-ve_8.4-1.iso"
             iso_name="proxmox-ve_8.4-1.iso"
             ;;
         2)
-            iso_url="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-12.2.0-amd64-netinst.iso"
-            iso_name="debian-12.2.0-amd64-netinst.iso"
+            iso_url="https://enterprise.proxmox.com/iso/proxmox-ve_9.0-1.iso"
+            iso_name="proxmox-ve_9.0-1.iso"
             ;;
         3)
-            iso_url="https://releases.ubuntu.com/22.04/ubuntu-22.04.3-live-server-amd64.iso"
-            iso_name="ubuntu-22.04.3-live-server-amd64.iso"
+            iso_url="https://cdimage.debian.org/mirror/cdimage/archive/12.12.0/amd64/iso-cd/debian-12.12.0-amd64-netinst.iso"
+            iso_name="debian-12.12.0-amd64-netinst.iso"
             ;;
         4)
             if [ "$LANG" = "en" ]; then
@@ -403,8 +408,16 @@ menuentry "$iso_name Installer" {
     set isofile="/$iso_name"
     search --no-floppy --set=root --file \$isofile
     loopback loop \$isofile
-    linux (loop)/boot/vmlinuz boot=iso iso-scan/filename=\$isofile
-    initrd (loop)/boot/initrd.img
+    
+    # 根据ISO类型选择正确的内核和initrd路径
+    if [ -f (loop)/boot/vmlinuz ]; then
+        linux (loop)/boot/vmlinuz boot=iso iso-scan/filename=\$isofile
+        initrd (loop)/boot/initrd.img
+    else
+        # 尝试Proxmox VE的路径
+        linux (loop)/proxmox/vmlinuz boot=iso iso-scan/filename=\$isofile
+        initrd (loop)/proxmox/initrd.img
+    fi
 }
 EOF
         
@@ -415,9 +428,11 @@ EOF
         if [ "$LANG" = "en" ]; then
             echo -e "${GREEN}Local installation configuration completed${NC}"
             echo -e "${YELLOW}Select '$iso_name Installer' after reboot to begin installation${NC}"
+            echo -e "${YELLOW}Note: Proxmox VE enterprise ISOs may require a valid subscription${NC}"
         else
             echo -e "${GREEN}本地安装配置完成${NC}"
             echo -e "${YELLOW}重启后选择 '$iso_name Installer' 即可开始安装${NC}"
+            echo -e "${YELLOW}注意: Proxmox VE 企业版ISO可能需要有效的订阅${NC}"
         fi
     else
         if [ "$LANG" = "en" ]; then
