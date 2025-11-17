@@ -3,7 +3,7 @@ apt update && apt upgrade -y && apt install -y curl wget net-tools sudo
 
 # 下载ISO到根目录
 cd /
-wget https://download.proxmox.com/iso/proxmox-ve_8.4-1.iso
+wget https://enterprise.proxmox.com/iso/proxmox-ve_8.4-1.iso
 
 # 写入正确的GRUB配置
 cat > /etc/grub.d/40_custom <<'EOF'
