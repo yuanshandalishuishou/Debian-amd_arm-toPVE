@@ -1,3 +1,5 @@
+#使用方法 wget https://raw.githubusercontent.com/yuanshandalishuishou/Debian-amd_arm-toPVE/main/install_pve_from_iso.sh && bash ./install_pve_from_iso.sh
+
 #!/bin/bash
 
 # 颜色定义
